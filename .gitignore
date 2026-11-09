@@ -1,3 +1,7 @@
 build/
 *.log
 *-diag.txt
+*.exe
+*.state
+*.tmp
+*.bak

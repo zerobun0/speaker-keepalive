@@ -35,7 +35,31 @@ attenuated output, so at low volume the keep-alive is just as quiet as the music
   level drops gradually (about -53 dBFS at 2%).
 - Runs only while some app is actually producing sound, plus 5 minutes, so your speakers can still
   sleep when the PC is idle. It also pauses while the PC is locked.
+- **Never clips your music.** Many onboard codecs (Realtek included) use *hardware* volume: Windows
+  sends the mix at full scale and the chip turns it down afterwards. A big compensated tone plus
+  loud music would go over full scale and crackle, so the tone ducks under the other apps' live peaks
+  (tone + everything else stays under 95% of full scale) and comes back slowly in quiet passages.
 - Survives device unplug/replug, format changes and sleep/resume, and keeps a log of what it did.
+
+### Output and volume memory (2.0)
+
+Windows switches the default output by itself when a device appears (a headset dongle, or monitor
+HDMI audio coming back when the screens wake), and FxSound follows it and copies its slider onto the
+new device. So the speakers come back on the wrong output or at a random volume. SpeakerKeepAlive:
+
+- **Remembers the output you picked** (through FxSound too) and switches back to it when the output
+  changes by itself: in the 12 seconds after startup, unlock, wake from sleep, or a device being
+  plugged in/out. A change at any other time is treated as yours and becomes the new remembered output.
+  If the remembered device is unplugged it waits, and switches back when it returns.
+- **Remembers each output's volume** and puts it back when it jumps by itself (within 5 seconds of an
+  output switch, or in the windows above). Volume changes you make at other times are remembered.
+- **Optional cap**: `VolumeCapDevice = Realtek` makes that output start at no more than
+  `VolumeCapPercent` (10%) unless you set it higher yourself.
+- Memory lives in `%LOCALAPPDATA%\SpeakerKeepAlive\SpeakerKeepAlive.state`, so it survives restarts and sleep.
+
+Known limits: if you deliberately pick another output (or move the volume) in those first few seconds
+after unlocking/plugging something in, it may be put back once; just do it again. When sound starts after
+a long silence, the tone needs about 20 ms to duck, which can rarely be a faint tick at the start.
 
 ## Install
 
@@ -53,7 +77,7 @@ puts it back.
 ## See what it's doing
 
 - Log: `%LOCALAPPDATA%\SpeakerKeepAlive\SpeakerKeepAlive.log`, which records the device it targets,
-  on/off, volume and the tone level at the speaker every 5 minutes.
+  on/off, every output/volume it put back, and volume and tone level at the speaker every 5 minutes.
 - Snapshot: `SpeakerKeepAlive.exe --diag` writes `SpeakerKeepAlive-diag.txt`, listing every
   output device, its volume in dB, the tone level that device needs, and every app's live audio peak.
 
@@ -68,6 +92,12 @@ puts it back.
 | `AlwaysOn` | `0` | `1` = ignore activity detection. |
 | `PauseWhenLocked` | `1` | Stop while locked. |
 | `Device` | `auto` | Or part of a device name to pin it. |
+| `Ceiling` | `0.95` | Tone + other apps' peaks are kept under this (1 = full scale). |
+| `DuckReleaseSeconds` | `15` | How slowly the tone returns after the music gets quieter. |
+| `RememberOutput` | `1` | Switch back to your output when it changes by itself. |
+| `RememberVolume` | `1` | Put each output's volume back when it jumps by itself. |
+| `VolumeCapDevice` | *(empty)* | Part of a device name to cap, e.g. `Realtek`. |
+| `VolumeCapPercent` | `10` | Starting cap for that device, unless you set it higher. |
 
 ## The limit, and the bulletproof setup
 

@@ -8,6 +8,10 @@
 // it forwards to), with amplitude continuously compensated for that endpoint's attenuation, so the
 // level at the speaker input stays constant regardless of volume. Runs only while other apps are
 // actually producing sound (plus a hang time), pauses on lock, survives device changes and sleep.
+// The tone ducks under other apps' peaks so tone + music never clips (hardware-volume devices).
+//
+// Also (2.0): remembers the output you picked and each output's volume, and puts them back when
+// Windows or FxSound change them by themselves (device plugged in, monitors waking, sleep, restart).
 //
 // Build: csc /target:winexe /out:SpeakerKeepAlive.exe SpeakerKeepAlive.cs   (.NET Framework 4.x)
 
@@ -125,6 +129,17 @@ namespace SpeakerKeepAlive
         [PreserveSig] int GetProcessId(out int pid);
     }
 
+    // Undocumented but long-stable (Windows 7..11) interface used by every "switch default device" tool.
+    [ComImport, Guid("870af99c-171d-4f9e-af0d-e63df40c2bc9")] class PolicyConfigCo { }
+
+    [Guid("f8679f50-850a-41cf-9c72-430f290290c8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPolicyConfig
+    {
+        int GetMixFormat(); int GetDeviceFormat(); int ResetDeviceFormat(); int SetDeviceFormat(); int GetProcessingPeriod();
+        int SetProcessingPeriod(); int GetShareMode(); int SetShareMode(); int GetPropertyValue(); int SetPropertyValue();
+        [PreserveSig] int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string id, int role);
+    }
+
     // ---------------------------------------------------------------- helpers
     static class Log
     {
@@ -154,6 +169,12 @@ namespace SpeakerKeepAlive
         public bool PauseWhenLocked = true;
         public bool AlwaysOn = false;         // ignore activity detection, run whenever unlocked
         public string Device = "auto";        // "auto" or a substring of the output's friendly name
+        public double Ceiling = 0.95;         // tone + other apps' peaks are kept under this (full scale = 1)
+        public double DuckReleaseSeconds = 15;// how slowly the tone comes back after other audio gets quiet
+        public bool RememberOutput = true;    // switch back to the user's output when Windows/FxSound change it by themselves
+        public bool RememberVolume = true;    // put each output's volume back when it jumps by itself
+        public string VolumeCapDevice = "";   // outputs whose name contains this start capped... ("" = no cap)
+        public double VolumeCapPercent = 10;  // ...at this volume, unless the user sets them higher
 
         public static Config Load(string path)
         {
@@ -177,6 +198,12 @@ namespace SpeakerKeepAlive
                         case "pausewhenlocked": c.PauseWhenLocked = v == "1" || v.ToLowerInvariant() == "true"; break;
                         case "alwayson": c.AlwaysOn = v == "1" || v.ToLowerInvariant() == "true"; break;
                         case "device": c.Device = v; break;
+                        case "ceiling": c.Ceiling = Math.Max(0.1, Math.Min(1, double.Parse(v, inv))); break;
+                        case "duckreleaseseconds": c.DuckReleaseSeconds = Math.Max(0.1, double.Parse(v, inv)); break;
+                        case "rememberoutput": c.RememberOutput = v == "1" || v.ToLowerInvariant() == "true"; break;
+                        case "remembervolume": c.RememberVolume = v == "1" || v.ToLowerInvariant() == "true"; break;
+                        case "volumecapdevice": c.VolumeCapDevice = v; break;
+                        case "volumecappercent": c.VolumeCapPercent = Math.Max(0, Math.Min(100, double.Parse(v, inv))); break;
                     }
                 }
                 catch { Log.W("config: bad value for " + k + ": " + v); }
@@ -207,6 +234,20 @@ namespace SpeakerKeepAlive
 
         public static string Id(IMMDevice d) { string id; d.GetId(out id); return id; }
 
+        // Make a device the Windows default output (console + multimedia; communications is left alone).
+        // FxSound notices within a few seconds, switches its own output to that device and takes the default back.
+        public static bool SetDefault(string id)
+        {
+            try
+            {
+                var pc = (IPolicyConfig)new PolicyConfigCo();
+                int a = pc.SetDefaultEndpoint(id, 0), b = pc.SetDefaultEndpoint(id, 1);
+                Marshal.ReleaseComObject(pc);
+                return a == 0 && b == 0;
+            }
+            catch { return false; }
+        }
+
         public static T Activate<T>(IMMDevice d) where T : class
         {
             Guid g = typeof(T).GUID; object o;
@@ -221,6 +262,29 @@ namespace SpeakerKeepAlive
             if (Enumerator().EnumAudioEndpoints(0, 1, out c) != 0) return list;
             int n; c.GetCount(out n);
             for (int i = 0; i < n; i++) { IMMDevice d; if (c.Item(i, out d) == 0) list.Add(d); }
+            return list;
+        }
+
+        // Peak meters for every session on the device that isn't ours (caller releases them).
+        public static List<IAudioMeterInformation> OtherMeters(IMMDevice d, int selfPid)
+        {
+            var list = new List<IAudioMeterInformation>();
+            IAudioSessionManager2 mgr = null; IAudioSessionEnumerator en = null;
+            try
+            {
+                mgr = Activate<IAudioSessionManager2>(d);
+                if (mgr.GetSessionEnumerator(out en) != 0) return list;
+                int n; en.GetCount(out n);
+                for (int i = 0; i < n; i++)
+                {
+                    object s; if (en.GetSession(i, out s) != 0 || s == null) continue;
+                    var c2 = s as IAudioSessionControl2; var meter = s as IAudioMeterInformation; int pid = -1;
+                    if (c2 != null) c2.GetProcessId(out pid);
+                    if (meter != null && pid != selfPid) list.Add(meter); else Marshal.ReleaseComObject(s);
+                }
+            }
+            catch { }
+            finally { if (en != null) Marshal.ReleaseComObject(en); if (mgr != null) Marshal.ReleaseComObject(mgr); }
             return list;
         }
 
@@ -263,15 +327,23 @@ namespace SpeakerKeepAlive
     class ToneStream : IDisposable
     {
         public readonly string DeviceId, DeviceName;
+        readonly IMMDevice dev;
         readonly IAudioClient client; readonly IAudioRenderClient render; readonly IAudioEndpointVolume vol;
         readonly AutoResetEvent evt = new AutoResetEvent(false);
         readonly int channels, rate, bufferFrames; readonly bool isFloat; readonly int bytesPerSample;
-        double phase, amp; readonly Config cfg;
+        readonly float[] fbuf; readonly byte[] bbuf;   // reused every period: no per-sample allocations
+        double phase, amp; readonly Config cfg; readonly int selfPid;
         public double LastVolumeDb; public double LastAmp; public bool Muted;
 
-        public ToneStream(IMMDevice dev, Config cfg)
+        // Peak meters of every other app's session on this device, refreshed once a second.
+        List<IAudioMeterInformation> others = new List<IAudioMeterInformation>();
+        DateTime nextMeters = DateTime.MinValue;
+        readonly Stopwatch duckClock = Stopwatch.StartNew();
+        double duckPeak; public double LastDuckPeak;
+
+        public ToneStream(IMMDevice dev, Config cfg, int selfPid)
         {
-            this.cfg = cfg;
+            this.cfg = cfg; this.dev = dev; this.selfPid = selfPid;
             DeviceId = Audio.Id(dev); DeviceName = Audio.Name(dev);
             vol = Audio.Activate<IAudioEndpointVolume>(dev);
             client = Audio.Activate<IAudioClient>(dev);
@@ -293,6 +365,7 @@ namespace SpeakerKeepAlive
             finally { Marshal.FreeCoTaskMem(fmt); }
             Check(client.SetEventHandle(evt.SafeWaitHandle.DangerousGetHandle()), "SetEventHandle");
             int bf; Check(client.GetBufferSize(out bf), "GetBufferSize"); bufferFrames = bf;
+            if (isFloat && bytesPerSample == 4) fbuf = new float[bufferFrames * channels]; else bbuf = new byte[bufferFrames * channels * bytesPerSample];
             Guid g = typeof(IAudioRenderClient).GUID; object o;
             Check(client.GetService(ref g, out o), "GetService"); render = (IAudioRenderClient)o;
             Fill(bufferFrames, 0); // prime with silence
@@ -303,16 +376,31 @@ namespace SpeakerKeepAlive
 
         static void Check(int hr, string what) { if (hr != 0) throw new COMException(what, hr); }
 
-        // Desired generated amplitude so that (amplitude * endpoint gain) == target level.
+        void ReleaseMeters() { foreach (var m in others) try { Marshal.ReleaseComObject(m); } catch { } others.Clear(); }
+
+        // Desired generated amplitude so that (amplitude * endpoint gain) == target level,
+        // limited so that tone + everything else on the device never exceeds full scale.
+        // With HARDWARE endpoint volume (Realtek) the digital mix is sent at full scale and the
+        // codec attenuates afterwards, so a big tone plus music clips / hits the limiter = crackle.
         double DesiredAmp(bool fadingOut)
         {
+            var now = DateTime.Now;
+            if (now >= nextMeters) { nextMeters = now.AddSeconds(1); ReleaseMeters(); others = Audio.OtherMeters(dev, selfPid); }
+            // Headroom: sum of other sessions' peaks (upper bound of their mix), held with a slow release
+            // so gaps between songs don't let the tone climb back and clip the next song's first beat.
+            double dt = duckClock.Elapsed.TotalSeconds; duckClock.Restart();
+            double peakNow = 0;
+            foreach (var m in others) { float p; try { if (m.GetPeakValue(out p) == 0) peakNow += p; } catch { } }
+            duckPeak = Math.Max(peakNow, duckPeak * Math.Exp(-dt / cfg.DuckReleaseSeconds));
+            LastDuckPeak = duckPeak;
             if (fadingOut) return 0;
             float db; bool mute;
             if (vol.GetMasterVolumeLevel(out db) != 0) db = 0;
             vol.GetMute(out mute); Muted = mute; LastVolumeDb = db;
             if (mute) return 0; // muted on purpose: let it be quiet
             double a = Math.Pow(10, (cfg.TargetDbfs - db) / 20.0);
-            return Math.Min(a, cfg.MaxAmplitude);
+            double room = Math.Max(0, cfg.Ceiling - duckPeak);
+            return Math.Min(Math.Min(a, cfg.MaxAmplitude), room);
         }
 
         // Pump one engine period. Returns false when the device is gone and the stream must be rebuilt.
@@ -333,10 +421,8 @@ namespace SpeakerKeepAlive
             IntPtr buf; int hr = render.GetBuffer(frames, out buf);
             if (hr != 0) { Log.W("GetBuffer failed (0x" + hr.ToString("X8") + ")"); return false; }
             double step = 2 * Math.PI * cfg.FrequencyHz / rate;
-            // Rising: ~150 ms ramp (no clicks). Falling: ~5 ms (volume went up, back off right away).
+            // Rising: ~150 ms ramp (no clicks). Falling: ~5 ms (volume went up / music arrived, back off right away).
             double up = 1.0 / (0.150 * rate), down = 1.0 / (0.005 * rate);
-            int stride = channels * bytesPerSample;
-            var tmp = new byte[frames * stride];
             for (int f = 0; f < frames; f++)
             {
                 if (amp < target) amp = Math.Min(target, amp + (target - amp) * up + 1e-7);
@@ -345,14 +431,15 @@ namespace SpeakerKeepAlive
                 phase += step; if (phase > 2 * Math.PI) phase -= 2 * Math.PI;
                 for (int c = 0; c < channels; c++)
                 {
-                    int o = f * stride + c * bytesPerSample;
-                    if (isFloat) { var b = BitConverter.GetBytes((float)s); Buffer.BlockCopy(b, 0, tmp, o, 4); }
-                    else if (bytesPerSample == 2) { short v = (short)(s * 32767); tmp[o] = (byte)v; tmp[o + 1] = (byte)(v >> 8); }
-                    else if (bytesPerSample == 3) { int v = (int)(s * 8388607); tmp[o] = (byte)v; tmp[o + 1] = (byte)(v >> 8); tmp[o + 2] = (byte)(v >> 16); }
-                    else if (bytesPerSample == 4) { int v = (int)(s * 2147483647.0); var b = BitConverter.GetBytes(v); Buffer.BlockCopy(b, 0, tmp, o, 4); }
+                    if (fbuf != null) { fbuf[f * channels + c] = (float)s; continue; }
+                    int o = (f * channels + c) * bytesPerSample;
+                    if (bytesPerSample == 2) { int v = (int)(s * 32767); bbuf[o] = (byte)v; bbuf[o + 1] = (byte)(v >> 8); }
+                    else if (bytesPerSample == 3) { int v = (int)(s * 8388607); bbuf[o] = (byte)v; bbuf[o + 1] = (byte)(v >> 8); bbuf[o + 2] = (byte)(v >> 16); }
+                    else if (bytesPerSample == 4) { int v = (int)(s * 2147483647.0); bbuf[o] = (byte)v; bbuf[o + 1] = (byte)(v >> 8); bbuf[o + 2] = (byte)(v >> 16); bbuf[o + 3] = (byte)(v >> 24); }
                 }
             }
-            Marshal.Copy(tmp, 0, buf, tmp.Length);
+            if (fbuf != null) Marshal.Copy(fbuf, 0, buf, frames * channels);
+            else Marshal.Copy(bbuf, 0, buf, frames * channels * bytesPerSample);
             LastAmp = amp;
             return render.ReleaseBuffer(frames, 0) == 0;
         }
@@ -363,21 +450,222 @@ namespace SpeakerKeepAlive
             try { Marshal.ReleaseComObject(render); } catch { }
             try { Marshal.ReleaseComObject(client); } catch { }
             try { Marshal.ReleaseComObject(vol); } catch { }
+            ReleaseMeters();
             evt.Dispose();
+        }
+    }
+
+    // ---------------------------------------------------------------- render thread
+    // Owns the tone stream so the slow housekeeping on the main thread (device scans, file reads,
+    // switching outputs) can never make it miss an audio period.
+    static class Renderer
+    {
+        public static volatile string WantId;   // device to keep alive, null = fade out and stop
+        public static volatile string Who;      // app whose sound turned us on (for the log)
+        public static volatile bool Reset;      // rebuild the stream (after sleep)
+
+        [DllImport("avrt.dll", EntryPoint = "AvSetMmThreadCharacteristicsW", CharSet = CharSet.Unicode)]
+        static extern IntPtr AvSetMmThreadCharacteristics(string task, ref int index);
+
+        public static void Start(Config cfg, int selfPid)
+        {
+            var t = new Thread(() => Run(cfg, selfPid)) { IsBackground = true, Priority = ThreadPriority.Highest, Name = "render" };
+            t.SetApartmentState(ApartmentState.MTA);
+            t.Start();
+        }
+
+        static void Run(Config cfg, int selfPid)
+        {
+            try { int i = 0; AvSetMmThreadCharacteristics("Audio", ref i); } catch { }
+            ToneStream s = null; DateTime nextStatus = DateTime.Now.AddMinutes(1);
+            while (true)
+            {
+                try
+                {
+                    if (Reset) { Reset = false; if (s != null) { s.Dispose(); s = null; } }
+                    string want = WantId;
+                    if (s != null && want != null && want != s.DeviceId) { s.Dispose(); s = null; } // output switched
+                    if (s == null)
+                    {
+                        if (want == null) { Thread.Sleep(50); continue; }
+                        IMMDevice d;
+                        if (Audio.Enumerator().GetDevice(want, out d) != 0 || d == null) { Thread.Sleep(500); continue; }
+                        s = new ToneStream(d, cfg, selfPid);
+                        Log.W("keep-alive ON (sound from " + (Who ?? "?") + ")");
+                    }
+                    bool fading = want == null;
+                    if (!s.Pump(fading)) { s.Dispose(); s = null; Thread.Sleep(1000); continue; }
+                    if (fading && s.IsSilent) { s.Dispose(); s = null; Log.W("keep-alive OFF (idle " + cfg.HangSeconds + "s or locked)"); continue; }
+                    if (DateTime.Now >= nextStatus)
+                    {
+                        nextStatus = DateTime.Now.AddMinutes(5);
+                        Log.W(string.Format("status: \"{0}\" vol {1:0.0} dB{2}, tone amp {3:0.00000} -> {4:0.0} dBFS at speaker, other apps peak {5:0.00}",
+                            s.DeviceName, s.LastVolumeDb, s.Muted ? " MUTED" : "", s.LastAmp,
+                            s.LastAmp > 0 ? 20 * Math.Log10(s.LastAmp) + s.LastVolumeDb : double.NegativeInfinity, s.LastDuckPeak));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.W("render error: " + ex.Message);
+                    if (s != null) { try { s.Dispose(); } catch { } s = null; }
+                    Thread.Sleep(2000);
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- output + volume memory
+    // Windows switches the default output when a device appears (headset dongle, monitor HDMI audio
+    // after the screens wake), and FxSound follows it AND mirrors its own slider onto the new device,
+    // so the speakers come back on a different output and/or at a random volume. This remembers what
+    // the user picked and puts it back when a change happens "by itself".
+    class OutputGuard
+    {
+        const double OutputWindowSec = 12;   // after startup / unlock / wake / device plugged: changes are automatic
+        const double VolumeWindowSec = 5;    // after any output switch: volume jumps are automatic
+        const int MaxRestores = 3;           // per trigger, in case something keeps overriding us
+
+        readonly Config cfg; readonly string path;
+        readonly Dictionary<string, double> vols = new Dictionary<string, double>();
+        string preferred, lastEffective, lastSet;
+        DateTime outUntil = DateTime.MinValue, volUntil = DateTime.MinValue, lastRestore = DateTime.MinValue;
+        int restores; volatile string pending;
+        IAudioEndpointVolume volCtl; string volCtlId;
+
+        public OutputGuard(Config cfg, string dir)
+        {
+            this.cfg = cfg; path = Path.Combine(dir, "SpeakerKeepAlive.state");
+            try
+            {
+                if (File.Exists(path))
+                    foreach (var line in File.ReadAllLines(path))
+                    {
+                        int eq = line.IndexOf('='); if (eq < 0 || line.StartsWith("#")) continue;
+                        string k = line.Substring(0, eq), v = line.Substring(eq + 1);
+                        if (k == "output") preferred = v;
+                        else if (k.StartsWith("volume ")) vols[k.Substring(7)] = double.Parse(v, System.Globalization.CultureInfo.InvariantCulture);
+                    }
+            }
+            catch (Exception ex) { Log.W("state file unreadable, starting fresh: " + ex.Message); }
+        }
+
+        void Save()
+        {
+            try
+            {
+                var sb = new System.Text.StringBuilder("# SpeakerKeepAlive memory: last output you picked and each output's volume (0..1)\r\n");
+                if (preferred != null) sb.Append("output=").Append(preferred).Append("\r\n");
+                foreach (var kv in vols) sb.Append("volume ").Append(kv.Key).Append('=').Append(kv.Value.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture)).Append("\r\n");
+                File.WriteAllText(path + ".tmp", sb.ToString());
+                if (File.Exists(path)) File.Replace(path + ".tmp", path, null); else File.Move(path + ".tmp", path);
+            }
+            catch (Exception ex) { Log.W("could not save state: " + ex.Message); }
+        }
+
+        // Thread-safe: called from SystemEvents callbacks.
+        public void Trigger(string why) { pending = why; }
+
+        void Open(DateTime now, string why)
+        {
+            outUntil = now.AddSeconds(OutputWindowSec); volUntil = now.AddSeconds(OutputWindowSec); restores = 0;
+            Log.W("watching for automatic output/volume changes (" + why + ")");
+        }
+
+        static string Pct(double v) { return Math.Round(v * 100).ToString("0") + "%"; }
+
+        public void Tick(DateTime now, IMMDevice target, List<IMMDevice> all)
+        {
+            var p = pending; if (p != null) { pending = null; Open(now, p); }
+
+            var ids = new List<string>(); foreach (var d in all) ids.Add(Audio.Id(d)); ids.Sort();
+            string set = string.Join("|", ids.ToArray());
+            if (lastSet != null && set != lastSet) Open(now, "devices changed");
+            lastSet = set;
+
+            string eff = target == null ? null : Audio.Id(target);
+            bool switched = eff != lastEffective;
+            if (switched && lastEffective != null && now.AddSeconds(VolumeWindowSec) > volUntil) volUntil = now.AddSeconds(VolumeWindowSec);
+            lastEffective = eff;
+            if (eff == null) return;
+
+            // ---- output memory
+            if (cfg.RememberOutput)
+            {
+                if (preferred == null) { preferred = eff; Save(); Log.W("remembered output \"" + Audio.Name(target) + "\" (first run)"); }
+                else if (now < outUntil)
+                {
+                    if (preferred != null && eff != preferred && ids.Contains(preferred) && restores < MaxRestores
+                        && (now - lastRestore).TotalSeconds > 6)
+                    {
+                        restores++; lastRestore = now;
+                        string name = "?"; foreach (var d in all) if (Audio.Id(d) == preferred) name = Audio.Name(d);
+                        bool ok = Audio.SetDefault(preferred);
+                        Log.W("output changed by itself to \"" + Audio.Name(target) + "\", switching back to \"" + name + "\"" + (ok ? "" : " (FAILED)"));
+                        outUntil = now.AddSeconds(OutputWindowSec); volUntil = outUntil;
+                    }
+                }
+                else if (switched && preferred != eff) // only a real switch by the user, not a fallback after unplugging
+                {
+                    preferred = eff; Save();
+                    Log.W("remembered output \"" + Audio.Name(target) + "\"");
+                }
+            }
+
+            // ---- volume memory for the output that is actually playing
+            if (cfg.RememberVolume)
+            {
+                if (volCtlId != eff)
+                {
+                    if (volCtl != null) try { Marshal.ReleaseComObject(volCtl); } catch { }
+                    volCtl = Audio.Activate<IAudioEndpointVolume>(target); volCtlId = eff;
+                }
+                float curF; if (volCtl.GetMasterVolumeLevelScalar(out curF) != 0) return;
+                double cur = curF, mem;
+                bool capped = cfg.VolumeCapDevice.Length > 0 && Audio.Name(target).IndexOf(cfg.VolumeCapDevice, StringComparison.OrdinalIgnoreCase) >= 0;
+                double cap = cfg.VolumeCapPercent / 100.0;
+                if (!vols.TryGetValue(eff, out mem))
+                {
+                    mem = capped ? Math.Min(cur, cap) : cur; vols[eff] = mem; Save();
+                    Log.W("first time on \"" + Audio.Name(target) + "\": volume " + Pct(mem) + (capped ? " (capped at " + Pct(cap) + " until you set it higher)" : ""));
+                    if (Math.Abs(cur - mem) > 0.004) volCtl.SetMasterVolumeLevelScalar((float)mem, IntPtr.Zero);
+                }
+                else if (Math.Abs(cur - mem) > 0.004)
+                {
+                    if (now < volUntil)
+                    {
+                        volCtl.SetMasterVolumeLevelScalar((float)mem, IntPtr.Zero);
+                        Log.W("volume on \"" + Audio.Name(target) + "\" jumped to " + Pct(cur) + " by itself, put back to " + Pct(mem));
+                    }
+                    else { vols[eff] = cur; Save(); } // the user moved it
+                }
+            }
+        }
+
+        public string Describe(List<IMMDevice> all)
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (var d in all)
+            {
+                string id = Audio.Id(d); double v;
+                sb.AppendLine(string.Format("  {0}{1}{2}", Audio.Name(d), id == preferred ? "  <- remembered output" : "",
+                    vols.TryGetValue(id, out v) ? "  remembered volume " + Pct(v) : ""));
+            }
+            return sb.ToString();
         }
     }
 
     // ---------------------------------------------------------------- main loop
     static class Program
     {
+        const string Version = "2.0.0";
         static volatile bool locked, resumed;
+        static Mutex instanceMutex; // static so the GC can never release the single-instance lock
         static readonly int SelfPid = Process.GetCurrentProcess().Id;
 
         // Find the device that physically drives the speakers.
-        static IMMDevice ResolveTarget(Config cfg, out IMMDevice defaultDev, out string why)
+        static IMMDevice ResolveTarget(Config cfg, List<IMMDevice> all, out IMMDevice defaultDev, out string why)
         {
             defaultDev = null; why = "";
-            var all = Audio.ActiveRenderDevices();
             if (cfg.Device != "auto")
             {
                 foreach (var d in all) if (Audio.Name(d).IndexOf(cfg.Device, StringComparison.OrdinalIgnoreCase) >= 0) { why = "config Device=" + cfg.Device; Audio.Enumerator().GetDefaultAudioEndpoint(0, 0, out defaultDev); return d; }
@@ -407,7 +695,10 @@ namespace SpeakerKeepAlive
             {
                 var p = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FxSound", "FxSound.settings");
                 if (!File.Exists(p)) return null;
-                var m = Regex.Match(File.ReadAllText(p), "name=\"output_device_name\"\\s+val=\"([^\"]*)\"");
+                string text;
+                using (var fs = new FileStream(p, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                using (var r = new StreamReader(fs)) text = r.ReadToEnd();
+                var m = Regex.Match(text, "name=\"output_device_name\"\\s+val=\"([^\"]*)\"");
                 return m.Success ? System.Net.WebUtility.HtmlDecode(m.Groups[1].Value) : null;
             }
             catch { return null; }
@@ -417,13 +708,15 @@ namespace SpeakerKeepAlive
         static void Diag(string dir, Config cfg)
         {
             var sb = new System.Text.StringBuilder();
-            sb.AppendLine("SpeakerKeepAlive diagnostics  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            sb.AppendLine("SpeakerKeepAlive " + Version + " diagnostics  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            var all = Audio.ActiveRenderDevices();
             IMMDevice def; string why;
-            var t = ResolveTarget(cfg, out def, out why);
+            var t = ResolveTarget(cfg, all, out def, out why);
             sb.AppendLine("default output : " + (def == null ? "(none)" : Audio.Name(def)));
             sb.AppendLine("keep-alive on  : " + (t == null ? "(none)" : Audio.Name(t)) + "   [" + why + "]");
+            sb.AppendLine("memory:"); sb.Append(new OutputGuard(cfg, dir).Describe(all));
             sb.AppendLine();
-            foreach (var d in Audio.ActiveRenderDevices())
+            foreach (var d in all)
             {
                 float db = 0, sc = 0; bool mute = false;
                 try { var v = Audio.Activate<IAudioEndpointVolume>(d); v.GetMasterVolumeLevel(out db); v.GetMasterVolumeLevelScalar(out sc); v.GetMute(out mute); } catch { }
@@ -455,45 +748,50 @@ namespace SpeakerKeepAlive
             string dir = AppDomain.CurrentDomain.BaseDirectory;
             Log.PathName = Path.Combine(dir, "SpeakerKeepAlive.log");
             if (args.Length > 0 && args[0] == "--diag") { Diag(dir, Config.Load(Path.Combine(dir, "SpeakerKeepAlive.ini"))); return 0; }
-            bool created; var mutex = new Mutex(true, "Local\\SpeakerKeepAlive.SingleInstance", out created);
+            bool created; instanceMutex = new Mutex(true, "Local\\SpeakerKeepAlive.SingleInstance", out created);
             if (!created) return 0;
             var cfg = Config.Load(Path.Combine(dir, "SpeakerKeepAlive.ini"));
-            Log.W(string.Format("start v1.0  freq={0}Hz target={1}dBFS maxAmp={2} hang={3}s alwaysOn={4} device={5}",
-                cfg.FrequencyHz, cfg.TargetDbfs, cfg.MaxAmplitude, cfg.HangSeconds, cfg.AlwaysOn, cfg.Device));
+            Log.W(string.Format("start v{0}  freq={1}Hz target={2}dBFS maxAmp={3} ceiling={4} hang={5}s alwaysOn={6} device={7} rememberOutput={8} rememberVolume={9} cap={10}@{11}%",
+                Version, cfg.FrequencyHz, cfg.TargetDbfs, cfg.MaxAmplitude, cfg.Ceiling, cfg.HangSeconds, cfg.AlwaysOn, cfg.Device,
+                cfg.RememberOutput, cfg.RememberVolume, cfg.VolumeCapDevice, cfg.VolumeCapPercent));
 
+            var guard = new OutputGuard(cfg, dir);
+            guard.Trigger("startup");
             SystemEvents.SessionSwitch += (s, e) =>
             {
                 if (e.Reason == SessionSwitchReason.SessionLock) { locked = true; Log.W("session locked"); }
-                else if (e.Reason == SessionSwitchReason.SessionUnlock) { locked = false; Log.W("session unlocked"); }
+                else if (e.Reason == SessionSwitchReason.SessionUnlock) { locked = false; Log.W("session unlocked"); guard.Trigger("unlock"); }
             };
             SystemEvents.PowerModeChanged += (s, e) =>
             {
-                if (e.Mode == PowerModes.Resume) { resumed = true; Log.W("resumed from sleep"); }
+                if (e.Mode == PowerModes.Resume) { resumed = true; Log.W("resumed from sleep"); guard.Trigger("wake from sleep"); }
             };
 
-            ToneStream stream = null; string lastWhy = null; DateTime lastSound = DateTime.MinValue;
-            DateTime nextResolve = DateTime.MinValue, nextActivity = DateTime.MinValue, nextStatus = DateTime.Now.AddMinutes(1);
-            string targetId = null; IMMDevice target = null, defDev = null; bool fading = false; string lastWho = null;
+            Renderer.Start(cfg, SelfPid);
+            string lastWhy = null, targetId = null, lastWho = null; DateTime lastSound = DateTime.MinValue;
+            DateTime nextResolve = DateTime.MinValue, nextActivity = DateTime.MinValue;
+            IMMDevice target = null, defDev = null;
 
             while (true)
             {
                 try
                 {
                     var now = DateTime.Now;
-                    if (resumed) { resumed = false; if (stream != null) { stream.Dispose(); stream = null; } nextResolve = now; }
+                    if (resumed) { resumed = false; Renderer.Reset = true; nextResolve = now; }
 
                     if (now >= nextResolve)
                     {
-                        nextResolve = now.AddSeconds(2);
-                        string why; var t = ResolveTarget(cfg, out defDev, out why);
+                        nextResolve = now.AddMilliseconds(500);
+                        var all = Audio.ActiveRenderDevices();
+                        string why; var t = ResolveTarget(cfg, all, out defDev, out why);
                         string id = t == null ? null : Audio.Id(t);
                         if (why != lastWhy || id != targetId)
                         {
                             Log.W("target: " + (t == null ? "(none)" : "\"" + Audio.Name(t) + "\"") + "  [" + why + "]");
                             lastWhy = why;
                         }
-                        if (id != targetId && stream != null) { stream.Dispose(); stream = null; }
                         targetId = id; target = t;
+                        try { guard.Tick(now, t, all); } catch (Exception ex) { Log.W("guard error: " + ex.Message); }
                     }
 
                     if (now >= nextActivity)
@@ -502,38 +800,18 @@ namespace SpeakerKeepAlive
                         string who = null;
                         bool sound = (defDev != null && Audio.HasRealSound(defDev, SelfPid, out who))
                                   || (target != null && Audio.HasRealSound(target, SelfPid, out who));
-                        if (sound) { lastSound = now; if (who != lastWho) { lastWho = who; } }
+                        if (sound) { lastSound = now; lastWho = who; }
                     }
 
                     bool wanted = target != null && !(cfg.PauseWhenLocked && locked)
                                   && (cfg.AlwaysOn || (now - lastSound).TotalSeconds < cfg.HangSeconds);
-
-                    if (wanted && stream == null)
-                    {
-                        stream = new ToneStream(target, cfg); fading = false;
-                        Log.W("keep-alive ON (sound from " + (lastWho ?? "?") + ")");
-                    }
-                    else if (wanted) fading = false;
-                    else if (!wanted && stream != null && !fading) { fading = true; }
-
-                    if (stream != null)
-                    {
-                        if (!stream.Pump(fading)) { stream.Dispose(); stream = null; nextResolve = DateTime.MinValue; Thread.Sleep(1000); continue; }
-                        if (fading && stream.IsSilent) { stream.Dispose(); stream = null; fading = false; Log.W("keep-alive OFF (idle " + cfg.HangSeconds + "s or locked)"); }
-                        if (stream != null && now >= nextStatus)
-                        {
-                            nextStatus = now.AddMinutes(5);
-                            Log.W(string.Format("status: \"{0}\" vol {1:0.0} dB{2}, tone amp {3:0.00000} -> {4:0.0} dBFS at speaker",
-                                stream.DeviceName, stream.LastVolumeDb, stream.Muted ? " MUTED" : "", stream.LastAmp,
-                                stream.LastAmp > 0 ? 20 * Math.Log10(stream.LastAmp) + stream.LastVolumeDb : double.NegativeInfinity));
-                        }
-                    }
-                    else Thread.Sleep(100);
+                    Renderer.Who = lastWho;
+                    Renderer.WantId = wanted ? targetId : null;
+                    Thread.Sleep(100);
                 }
                 catch (Exception ex)
                 {
                     Log.W("error: " + ex.Message);
-                    if (stream != null) { try { stream.Dispose(); } catch { } stream = null; }
                     nextResolve = DateTime.MinValue;
                     Thread.Sleep(2000);
                 }
